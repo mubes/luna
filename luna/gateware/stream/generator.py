@@ -177,6 +177,8 @@ class ConstantStreamGenerator(Elaboratable):
             (position_in_stream          == (data_length - 1)) | \
             (bytes_sent + bytes_per_word >= self.max_length)
 
+        on_packet_end   = position_in_stream[:6] == 63
+        on_packet_start = position_in_stream[:6] == 0
 
         #
         # Output length field.
@@ -210,6 +212,12 @@ class ConstantStreamGenerator(Elaboratable):
                 with m.If(self.start & (self.max_length > 0)):
                     m.next = 'STREAMING'
 
+            # WAITING -- we've finished one packet and are waiting to send the next.
+            with m.State('WAITING'):
+
+                # Once the user requests that we start, move to our stream being valid.
+                with m.If(self.start & (self.max_length > 0)):
+                    m.next = 'STREAMING'
 
             # STREAMING -- we're actively transmitting data
             with m.State('STREAMING'):
@@ -220,7 +228,9 @@ class ConstantStreamGenerator(Elaboratable):
 
                     ## ... and base First and Last based on our current position in the stream.
                     self.stream.first    .eq(on_first_packet),
-                    self.stream.last     .eq(on_last_packet)
+                    self.stream.last     .eq(on_last_packet),
+                    self.stream.first    .eq(on_first_packet | on_packet_start),
+                    self.stream.last     .eq(on_last_packet | on_packet_end)
                 ]
 
                 # Our ``valid`` flag requires a bunch of special handling, since it could be
@@ -294,6 +304,9 @@ class ConstantStreamGenerator(Elaboratable):
 
                 # If the current data byte is accepted, move past it.
                 with m.If(self.stream.ready):
+
+                    with m.If(on_packet_end):
+                        m.next = 'WAITING'
 
                     # If there's still data left to transmit, move forward.
                     with m.If(~on_last_packet):

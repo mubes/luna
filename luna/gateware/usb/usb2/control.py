@@ -200,7 +200,7 @@ class USBControlEndpoint(Elaboratable):
 
             # Fix our data PIDs to DATA1, for now, as we don't support multi-packet responses, yet.
             # Per [USB2.0: 8.5.3], the first packet of the DATA or STATUS phase always carries a DATA1 PID.
-            interface.tx_pid_toggle.eq(1)
+            #interface.tx_pid_toggle.eq(1)
         ]
 
 
@@ -217,6 +217,8 @@ class USBControlEndpoint(Elaboratable):
 
                 # We won't do anything until we receive a SETUP token.
                 with m.If(setup_decoder.packet.received & endpoint_targeted):
+
+                    m.d.usb += interface.tx_pid_toggle.eq(1)
 
                     # If our SETUP packet indicates we'll have a data stage (wLength > 0)
                     # move to the DATA stage. Otherwise, move directly to the status stage [8.5.3].
@@ -244,6 +246,9 @@ class USBControlEndpoint(Elaboratable):
 
                     # Notify the request handler to prepare a response.
                     m.d.comb += request_handler.data_requested.eq(1)
+
+                with m.If(request_handler.tx.valid & request_handler.tx.ready & request_handler.tx.last):
+                    m.d.usb += interface.tx_pid_toggle[0].eq(~interface.tx_pid_toggle[0])
 
                 # Once we get an OUT token, we should move on to the STATUS stage. [USB2, 8.5.3]
                 with m.If(endpoint_targeted & interface.tokenizer.new_token & interface.tokenizer.is_out):
