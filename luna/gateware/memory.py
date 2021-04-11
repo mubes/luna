@@ -12,6 +12,7 @@ import unittest
 
 from nmigen import Elaboratable, Module, Signal, Memory
 from nmigen.hdl.xfrm import DomainRenamer
+from nmigen.lib.cdc  import FFSynchronizer
 
 
 from .test import LunaGatewareTestCase, sync_test_case
@@ -77,14 +78,17 @@ class TransactionalizedFIFO(Elaboratable):
         The name of the relevant FIFO; to produce nicer debug output.
         If not provided, nMigen will attempt auto-detection.
     domain: str
-        The name of the domain this module should exist in.
+        The name of the domain this module should exist in & write side access.
+    rddomain: str
+        The name of the domain for read side access
     """
 
-    def __init__(self, *, width, depth, name=None, domain="sync"):
-        self.width  = width
-        self.depth  = depth
-        self.name   = name
-        self.domain = domain
+    def __init__(self, *, width, depth, name=None, domain="sync", rddomain=None):
+        self.width    = width
+        self.depth    = depth
+        self.name     = name
+        self.domain   = domain
+        self.rddomain = rddomain if rddomain is not None else domain
 
         #
         # I/O port
@@ -114,8 +118,8 @@ class TransactionalizedFIFO(Elaboratable):
         # Core internal "backing store".
         #
         memory = Memory(width=self.width, depth=self.depth + 1, name=self.name)
-        m.submodules.read_port  = read_port  = memory.read_port()
-        m.submodules.write_port = write_port = memory.write_port()
+        m.submodules.read_port  = read_port  = memory.read_port(domain=self.rddomain)
+        m.submodules.write_port = write_port = memory.write_port(domain=self.domain)
 
         # Always connect up our memory's data/en ports to ours.
         m.d.comb += [
@@ -131,24 +135,25 @@ class TransactionalizedFIFO(Elaboratable):
 
         # We'll track two pieces of data: our _committed_ write position, and our current un-committed write one.
         # This will allow us to rapidly backtrack to our pre-commit position.
-        committed_write_pointer = Signal(address_range)
-        current_write_pointer   = Signal(address_range)
+        committed_write_pointer     = Signal(address_range)
+        current_write_pointer       = Signal(address_range)
+        committed_write_pointer_cdc = Signal(address_range)
         m.d.comb += write_port.addr.eq(current_write_pointer)
 
         # If we're writing to the fifo, update our current write position.
         with m.If(self.write_en & ~self.full):
             with m.If(current_write_pointer == self.depth):
-                m.d.sync += current_write_pointer.eq(0)
+                m.d[self.domain] += current_write_pointer.eq(0)
             with m.Else():
-                m.d.sync += current_write_pointer.eq(current_write_pointer + 1)
+                m.d[self.domain] += current_write_pointer.eq(current_write_pointer + 1)
 
         # If we're committing a FIFO write, update our committed position.
         with m.If(self.write_commit):
-            m.d.sync += committed_write_pointer.eq(current_write_pointer)
+            m.d[self.domain] += committed_write_pointer.eq(current_write_pointer)
 
         # If we're discarding our current write, reset our current position,
         with m.If(self.write_discard):
-            m.d.sync += current_write_pointer.eq(committed_write_pointer)
+            m.d[self.domain] += current_write_pointer.eq(committed_write_pointer)
 
 
         #
@@ -157,8 +162,9 @@ class TransactionalizedFIFO(Elaboratable):
 
         # We'll track two pieces of data: our _committed_ read position, and our current un-committed read one.
         # This will allow us to rapidly backtrack to our pre-commit position.
-        committed_read_pointer = Signal(address_range)
-        current_read_pointer   = Signal(address_range)
+        committed_read_pointer     = Signal(address_range)
+        current_read_pointer       = Signal(address_range)
+        committed_read_pointer_cdc = Signal(address_range)
 
 
         # Compute the location for the next read, accounting for wraparound. We'll not assume a binary-sized
@@ -181,16 +187,21 @@ class TransactionalizedFIFO(Elaboratable):
 
         # If we're reading from our the fifo, update our current read position.
         with m.If(self.read_en & ~self.empty):
-            m.d.sync += current_read_pointer.eq(next_read_pointer)
+            m.d[self.rddomain] += current_read_pointer.eq(next_read_pointer)
 
-        # If we're committing a FIFO write, update our committed position.
+        # If we're committing a FIFO read, update our committed position.
         with m.If(self.read_commit):
-            m.d.sync += committed_read_pointer.eq(current_read_pointer)
+            m.d[self.domain] += committed_read_pointer.eq(current_read_pointer)
 
-        # If we're discarding our current write, reset our current position,
+        # If we're discarding our current read, reset our current position,
         with m.If(self.read_discard):
-            m.d.sync += current_read_pointer.eq(committed_read_pointer)
+            m.d[self.rddomain] += current_read_pointer.eq(committed_read_pointer)
 
+        # Make cdc'ed levels available for other domain to access
+        # Accessible by writing domain...
+        m.submodules.committed_read_pointer_cdc = FFSynchronizer(committed_read_pointer,committed_read_pointer_cdc,o_domain=self.domain)
+        # Accessible by reading domain...
+        m.submodules.committed_write_pointer_cdc = FFSynchronizer(committed_write_pointer,committed_write_pointer_cdc,o_domain=self.rddomain)
 
         #
         # FIFO status.
@@ -198,25 +209,25 @@ class TransactionalizedFIFO(Elaboratable):
 
         # Our FIFO is empty if our read and write pointers are in the same. We'll use the current
         # read position (which leads ahead) and the committed write position (which lags behind).
-        m.d.comb += self.empty.eq(current_read_pointer == committed_write_pointer)
+        m.d.comb += self.empty.eq(current_read_pointer == committed_write_pointer_cdc)
 
         # For our space available, we'll use the current write position (which leads ahead) and our committed
         # read position (which lags behind). This yields two cases: one where the buffer isn't wrapped around,
         # and one where it is.
         with m.If(self.full):
             m.d.comb += self.space_available.eq(0)
-        with m.Elif(committed_read_pointer <= current_write_pointer):
-            m.d.comb += self.space_available.eq(self.depth - (current_write_pointer - committed_read_pointer))
+        with m.Elif(committed_read_pointer_cdc <= current_write_pointer):
+            m.d.comb += self.space_available.eq(self.depth - (current_write_pointer - committed_read_pointer_cdc))
         with m.Else():
-            m.d.comb += self.space_available.eq(committed_read_pointer - current_write_pointer - 1)
+            m.d.comb += self.space_available.eq(committed_read_pointer_cdc - current_write_pointer - 1)
 
         # Our FIFO is full if we don't have any space available.
-        m.d.comb += self.full.eq(current_write_pointer + 1 == committed_read_pointer)
+        m.d.comb += self.full.eq(current_write_pointer + 1 == committed_read_pointer_cdc)
 
 
         # If we're not supposed to be in the sync domain, rename our sync domain to the target.
-        if self.domain != "sync":
-            m = DomainRenamer({"sync": self.domain})(m)
+        #if self.domain != "sync":
+        m = DomainRenamer({"sync": self.domain})(m)
 
         return m
 

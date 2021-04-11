@@ -13,6 +13,7 @@ import unittest
 
 from nmigen         import Signal, Elaboratable, Module, Array
 from nmigen.hdl.mem import Memory
+from nmigen.lib.cdc import FFSynchronizer
 
 from .packet        import HandshakeExchangeInterface, TokenDetectorInterface
 from ..stream       import USBInStreamInterface
@@ -69,11 +70,14 @@ class USBInTransferManager(Elaboratable):
     ----------
     max_packet_size: int
         The maximum packet size for our associated endpoint, in bytes.
+    epdomain: string
+        The domain of the endpoint
     """
 
-    def __init__(self, max_packet_size):
+    def __init__(self, max_packet_size, epdomain="usb"):
 
         self._max_packet_size = max_packet_size
+        self._epdomain = epdomain
 
         #
         # I/O port
@@ -95,6 +99,8 @@ class USBInTransferManager(Elaboratable):
         self.start_with_data1 = Signal()
         self.reset_sequence   = Signal()
 
+        self.write_fill_count_cdc  = Signal()
+        self.write_stream_ended_cdc = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -129,7 +135,7 @@ class USBInTransferManager(Elaboratable):
         # Since each buffer will be used for every other transaction, and our PID toggle flips every other transcation,
         # we'll identify which buffer we're targeting by the current PID toggle.
         buffer = Array(Memory(width=8, depth=self._max_packet_size, name=f"transmit_buffer_{i}") for i in range(2))
-        buffer_write_ports = Array(buffer[i].write_port(domain="usb") for i in range(2))
+        buffer_write_ports = Array(buffer[i].write_port(domain=self._epdomain) for i in range(2))
         buffer_read_ports  = Array(buffer[i].read_port(domain="usb") for i in range(2))
 
         m.submodules.read_port_0,  m.submodules.read_port_1  = buffer_read_ports
@@ -156,7 +162,9 @@ class USBInTransferManager(Elaboratable):
 
         # Create shortcuts to active fill_count / stream_ended signals for the buffer being written.
         write_fill_count   = buffer_fill_count[write_buffer_number]
+        m.submodules.write_fill_cdc = FFSynchronizer( write_fill_count, self.write_fill_count_cdc, o_domain="usb" )
         write_stream_ended = buffer_stream_ended[write_buffer_number]
+        m.submodules.write_stream_cdc = FFSynchronizer( write_stream_ended, self.write_stream_ended_cdc, o_domain="usb" )
 
         # Create shortcuts to the fill_count / stream_ended signals for the packet being sent.
         read_fill_count   = buffer_fill_count[read_buffer_number]
@@ -175,7 +183,7 @@ class USBInTransferManager(Elaboratable):
         # we can just unconditionally connect these.
         m.d.comb += [
 
-            # We'll only ever -write- data from our input stream...
+            # We'll only ever -write- data from our input stream in self._epdomain...
             buffer_write_ports[0].data   .eq(in_stream.payload),
             buffer_write_ports[0].addr   .eq(write_fill_count),
             buffer_write_ports[1].data   .eq(in_stream.payload),
@@ -186,17 +194,17 @@ class USBInTransferManager(Elaboratable):
             out_stream.payload           .eq(buffer_read.data),
 
             # We're ready to receive data iff we have space in the buffer we're currently filling.
-            in_stream.ready              .eq((write_fill_count != self._max_packet_size) & ~write_stream_ended),
+            in_stream.ready              .eq((self.write_fill_count_cdc != self._max_packet_size) & ~self.write_stream_ended_cdc),
             buffer_write.en              .eq(in_stream.valid & in_stream.ready)
         ]
 
         # Increment our fill count whenever we accept new data.
         with m.If(buffer_write.en):
-            m.d.usb += write_fill_count.eq(write_fill_count + 1)
+            m.d[self._epdomain] += write_fill_count.eq(write_fill_count + 1)
 
         # If the stream ends while we're adding data to the buffer, mark this as an ended stream.
         with m.If(in_stream.last & buffer_write.en):
-            m.d.usb += write_stream_ended.eq(1)
+            m.d[self._epdomain] += write_stream_ended.eq(1)
 
 
         # Shortcut for when we need to deal with an in token.
@@ -215,7 +223,7 @@ class USBInTransferManager(Elaboratable):
 
                 # If we have valid data that will end our packet, we're no longer waiting for data.
                 # We'll now wait for the host to request data from us.
-                packet_complete = (write_fill_count + 1 == self._max_packet_size)
+                packet_complete = (self.write_fill_count_cdc + 1 == self._max_packet_size)
                 will_end_packet = packet_complete | in_stream.last
 
                 with m.If(in_stream.valid & will_end_packet):
@@ -223,16 +231,13 @@ class USBInTransferManager(Elaboratable):
                     # If we've just finished a packet, we now have data we can send!
                     with m.If(packet_complete | in_stream.last):
                         m.next = "WAIT_TO_SEND"
-                        m.d.usb += [
 
-                            # We're now ready to take the data we've captured and _transmit_ it.
-                            # We'll swap our read and write buffers, and toggle our data PID.
-                            self.data_pid[0]    .eq(~self.data_pid[0]),
+                        # We're now ready to take the data we've captured and _transmit_ it.
+                        # We'll swap our read and write buffers, and toggle our data PID.
+                        m.d.usb += self.data_pid[0]    .eq(~self.data_pid[0]),
 
-                            # Mark our current stream as no longer having ended.
-                            read_stream_ended  .eq(0)
-                        ]
-
+                        # Mark our current stream as no longer having ended.
+                        m.d[self._epdomain] += read_stream_ended  .eq(0)
 
             # WAIT_TO_SEND -- we now have at least a buffer full of data to send; we'll
             # need to wait for an IN token to send it.
@@ -255,7 +260,7 @@ class USBInTransferManager(Elaboratable):
                             out_stream.last   .eq(1),
                         ]
                         # ... and clear the need to follow up with one, since we've just sent a short packet.
-                        m.d.usb += read_stream_ended.eq(0)
+                        m.d[self._epdomain] += read_stream_ended.eq(0)
                         m.next = "WAIT_FOR_ACK"
 
 
@@ -298,7 +303,7 @@ class USBInTransferManager(Elaboratable):
                 # If the host does ACK...
                 with m.If(self.handshakes_in.ack):
                     # ... clear the data we've sent from our buffer.
-                    m.d.usb += read_fill_count.eq(0)
+                    m.d[self._epdomain] += read_fill_count.eq(0)
 
                     # Figure out if we'll need to follow up with a ZLP. If we have ZLP generation enabled,
                     # we'll make sure we end on a short packet. If this is max-packet-size packet _and_ our
@@ -315,13 +320,11 @@ class USBInTransferManager(Elaboratable):
                     # for us in our "write buffer", which we've been filling in the background.
                     # If this is the case, we'll flip which buffer we're working with, toggle our data pid,
                     # and then ready ourselves for transmit.
-                    packet_completing = in_stream.valid & (write_fill_count + 1 == self._max_packet_size)
+                    packet_completing = in_stream.valid & (self.write_fill_count_cdc + 1 == self._max_packet_size)
                     with m.Elif(~in_stream.ready | packet_completing):
                         m.next = "WAIT_TO_SEND"
-                        m.d.usb += [
-                            self.data_pid[0]   .eq(~self.data_pid[0]),
-                            read_stream_ended  .eq(0)
-                        ]
+                        m.d.usb += self.data_pid[0]   .eq(~self.data_pid[0])
+                        m.d[self._epdomain] += read_stream_ended.eq(0)
 
                     # If neither of the above conditions are true; we now don't have enough data to send.
                     # We'll wait for enough data to transmit.

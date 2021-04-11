@@ -50,10 +50,11 @@ class USBStreamInEndpoint(Elaboratable):
     """
 
 
-    def __init__(self, *, endpoint_number, max_packet_size):
+    def __init__(self, *, endpoint_number, max_packet_size, domain="usb"):
 
         self._endpoint_number = endpoint_number
         self._max_packet_size = max_packet_size
+        self._epdomain        = domain
 
         #
         # I/O port
@@ -67,7 +68,7 @@ class USBStreamInEndpoint(Elaboratable):
         interface = self.interface
 
         # Create our transfer manager, which will be used to sequence packet transfers for our stream.
-        m.submodules.tx_manager = tx_manager = USBInTransferManager(self._max_packet_size)
+        m.submodules.tx_manager = tx_manager = USBInTransferManager(self._max_packet_size, epdomain=self._epdomain)
 
         m.d.comb += [
 
@@ -128,10 +129,11 @@ class USBMultibyteStreamInEndpoint(Elaboratable):
         The maximum packet size for this endpoint. Should match the wMaxPacketSize provided in the
         USB endpoint descriptor.
     """
-    def __init__(self, *, byte_width, endpoint_number, max_packet_size):
+    def __init__(self, *, byte_width, endpoint_number, max_packet_size,domain="sync"):
         self._byte_width      = byte_width
         self._endpoint_number = endpoint_number
         self._max_packet_size = max_packet_size
+        self._epdomain        = domain
 
         #
         # I/O port
@@ -146,7 +148,8 @@ class USBMultibyteStreamInEndpoint(Elaboratable):
         # Create our core, single-byte-wide endpoint, and attach it directly to our interface.
         m.submodules.stream_ep = stream_ep = USBStreamInEndpoint(
             endpoint_number=self._endpoint_number,
-            max_packet_size=self._max_packet_size
+            max_packet_size=self._max_packet_size,
+            domain         = self._epdomain
         )
         stream_ep.interface = self.interface
 
@@ -263,7 +266,7 @@ class USBStreamOutEndpoint(Elaboratable):
     """
 
 
-    def __init__(self, *, endpoint_number, max_packet_size, buffer_size=None):
+    def __init__(self, *, endpoint_number, max_packet_size, buffer_size=None, domain="usb"):
         self._endpoint_number = endpoint_number
         self._max_packet_size = max_packet_size
         self._buffer_size = buffer_size if (buffer_size is not None) else (self._max_packet_size * 2)
@@ -273,6 +276,7 @@ class USBStreamOutEndpoint(Elaboratable):
         #
         self.stream    = StreamInterface()
         self.interface = EndpointInterface()
+        self.epdomain  = domain
 
 
     def elaborate(self, platform):
@@ -310,7 +314,7 @@ class USBStreamOutEndpoint(Elaboratable):
         rx_last  = boundary_detector.last
 
         # Create a Rx FIFO.
-        m.submodules.fifo = fifo = TransactionalizedFIFO(width=10, depth=self._buffer_size, name="rx_fifo", domain="usb")
+        m.submodules.fifo = fifo = TransactionalizedFIFO(width=10, depth=self._buffer_size, name="rx_fifo", domain="usb", rddomain=self.epdomain)
 
         # Generate our `first` bit from the most recently transmitted bit.
         # Essentially, if the most recently valid byte was accompanied by an asserted `last`, the next byte
@@ -384,4 +388,3 @@ class USBStreamOutEndpoint(Elaboratable):
 
 
         return m
-
